@@ -29,10 +29,4 @@ ENV WORKERS=1
 ENV CPU_THREADS=4
 
 # Run the application with gunicorn in production
-CMD gunicorn whisper_api:app \
-    --workers ${WORKERS} \
-    --worker-class uvicorn.workers.UvicornWorker \
-    --bind ${HOST}:${PORT} \
-    --timeout 300 \
-    --access-logfile - \
-    --error-logfile -
+CMD ["sh", "-c", "gunicorn whisper_api:app --workers ${WORKERS} --worker-class uvicorn.workers.UvicornWorker --bind ${HOST}:${PORT} --timeout 300 --access-logfile - --error-logfile -"]
