@@ -1,20 +1,52 @@
-**pycache**
-_.pyc
-_.pyo
-_.pyd
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
 .Python
-_.so
-_.egg
-_.egg-info
+*.so
+*.egg
+*.egg-info
 dist
 build
+venv
+env
+
+# Environment
 .env
-_.wav
-_.mp3
-_.json
-_.txt
+.env.local
+
+# Audio/test files
+*.wav
+*.mp3
+*.mp4
+*.flac
+*.ogg
+
+# Data files (except requirements.txt)
+*.json
+*.txt
 !requirements.txt
+
+# Git
 .git
 .gitignore
+
+# Documentation/examples
 example_go_client.go
-README_API.md
+README*.md
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# Docker
+docker-compose*.yml
+Dockerfile
+.dockerignore
+
+# Logs
+*.log

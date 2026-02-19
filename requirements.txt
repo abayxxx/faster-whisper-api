@@ -8,3 +8,5 @@ pydub
 pyannote.audio
 torch
 torchaudio
+slowapi>=0.1.9
+google-generativeai>=0.3.0
