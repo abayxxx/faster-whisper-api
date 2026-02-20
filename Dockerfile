@@ -20,28 +20,6 @@ COPY whisper_api.py .
 # Expose port
 EXPOSE 8000
 
-# Set environment variables with defaults
-ENV HOST=0.0.0.0
-ENV PORT=8000
-ENV MODEL_SIZE=small
-ENV ENABLE_DIARIZATION=false
-ENV CPU_THREADS=4
-
-# Protection limits
-ENV MAX_CONCURRENT_REQUESTS=2
-ENV REQUEST_TIMEOUT=600
-ENV RATE_LIMIT=20/minute
-ENV MAX_FILE_SIZE_MB=100
-
-# Gemini AI for summarization
-ENV GEMINI_API_KEY=
-ENV GEMINI_MODEL=gemini-1.5-flash
-ENV JOB_EXPIRY_SECONDS=3600
-
-# Gunicorn workers (calculate based on your server)
-# Formula: min(CPU_cores / 2, RAM_GB / 4)
-ENV WORKERS=2
-
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:${PORT}/health').read()" || exit 1

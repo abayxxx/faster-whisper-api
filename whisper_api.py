@@ -460,7 +460,8 @@ async def health_check(request: Request):
         max_concurrent_requests=MAX_CONCURRENT_REQUESTS,
         rate_limit=RATE_LIMIT,
         global_rate_limit=GLOBAL_RATE_LIMIT,
-        max_file_size_mb=MAX_FILE_SIZE // (1024 * 1024)
+        max_file_size_mb=MAX_FILE_SIZE // (1024 * 1024),
+        ai_model=GEMINI_MODEL,
     )
 
 @app.post("/transcribe", response_model=JobResponse)
