@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
-import google.generativeai as genai
+from google import genai
 
 # Load environment variables from .env file
 load_dotenv()
@@ -83,10 +83,9 @@ model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8", cpu_threads=
 
 # Initialize Gemini AI
 if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel(GEMINI_MODEL)
+    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 else:
-    gemini_model = None
+    gemini_client = None
     print("Warning: GEMINI_API_KEY not set. Summarization will be disabled.")
 
 # Request queue semaphore to limit concurrent processing
@@ -202,22 +201,51 @@ def cleanup_old_jobs():
         if expired_jobs:
             print(f"Cleaned up {len(expired_jobs)} expired jobs")
 
-def summarize_text_with_gemini(text: str) -> str:
-    """Summarize text using Gemini API"""
-    if not gemini_model:
+def summarize_text_with_gemini(text: str) -> dict:
+    """Summarize text using Gemini API and generate next steps suggestion"""
+    if not gemini_client:
         raise Exception("Gemini API not configured. Set GEMINI_API_KEY in .env")
     
-    prompt = f"""Summarize the following transcript in a clear, concise paragraph. 
-Focus on the main topics, key points, and important information discussed.
+    prompt = f"""Analyze the following transcript and provide:
+
+1. A clear, concise summary paragraph focusing on main topics and key points
+2. A suggestion paragraph for recommended next steps or actions based on the conversation
+
+Format your response EXACTLY as follows:
+
+SUMMARY:
+[Your summary paragraph here]
+
+NEXT STEPS SUGGESTION:
+[Your next steps suggestion paragraph here]
 
 Transcript:
-{text}
-
-Summary:"""
+{text}"""
     
     try:
-        response = gemini_model.generate_content(prompt)
-        return response.text.strip()
+        response = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt
+        )
+        result_text = response.text.strip()
+        
+        # Parse the response to extract summary and next steps
+        summary = ""
+        next_steps_suggestion = ""
+        
+        if "SUMMARY:" in result_text and "NEXT STEPS SUGGESTION:" in result_text:
+            parts = result_text.split("NEXT STEPS SUGGESTION:")
+            summary = parts[0].replace("SUMMARY:", "").strip()
+            next_steps_suggestion = parts[1].strip()
+        else:
+            # Fallback if format not followed
+            summary = result_text
+            next_steps_suggestion = "Please review the transcript for further action items."
+        
+        return {
+            "summary": summary,
+            "next_steps_suggestion": next_steps_suggestion
+        }
     except Exception as e:
         raise Exception(f"Gemini API error: {str(e)}")
 
@@ -411,10 +439,13 @@ def process_summarization_job(job_id: str, input_type: str, **kwargs):
             with jobs_lock:
                 jobs[job_id]["progress"] = "summarizing"
             
-            summary = summarize_text_with_gemini(full_text)
+            gemini_result = summarize_text_with_gemini(full_text)
             
             # Build result
-            result = {"summary": summary}
+            result = {
+                "summary": gemini_result["summary"],
+                "next_steps_suggestion": gemini_result["next_steps_suggestion"]
+            }
             if transcript_data:
                 result["transcript"] = transcript_data
             
@@ -570,7 +601,7 @@ async def summarize(
         raise HTTPException(status_code=400, detail="Must provide either 'audio' file or 'text' parameter")
     
     # Check if Gemini is configured
-    if not gemini_model:
+    if not gemini_client:
         raise HTTPException(
             status_code=503,
             detail="Summarization service not configured. Set GEMINI_API_KEY in environment."
@@ -691,7 +722,7 @@ if __name__ == '__main__':
     print(f"Model: {MODEL_SIZE}")
     print(f"CPU Threads: {CPU_THREADS}")
     print(f"Diarization: {'Enabled' if ENABLE_DIARIZATION else 'Disabled'}")
-    print(f"Summarization: {'Enabled' if gemini_model else 'Disabled (set GEMINI_API_KEY to enable)'}")
+    print(f"Summarization: {'Enabled' if gemini_client else 'Disabled (set GEMINI_API_KEY to enable)'}")
     print(f"Authentication: {'Enabled' if API_KEY else 'Disabled (set API_KEY to enable)'}")
     print(f"\n--- Protection Limits ---")
     print(f"Max Concurrent Requests: {MAX_CONCURRENT_REQUESTS}")
