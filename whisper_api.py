@@ -86,7 +86,7 @@ if GEMINI_API_KEY:
     gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 else:
     gemini_client = None
-    print("Warning: GEMINI_API_KEY not set. Summarization will be disabled.")
+    print("Warning: GEMINI_API_KEY not set. Transcript polishing and summarization will be disabled.")
 
 # Request queue semaphore to limit concurrent processing
 request_semaphore = threading.Semaphore(MAX_CONCURRENT_REQUESTS)
@@ -116,6 +116,7 @@ class HealthResponse(BaseModel):
     status: str
     model: str
     diarization_enabled: bool
+    polishing_enabled: bool
     max_concurrent_requests: int
     rate_limit: str
     global_rate_limit: str
@@ -132,6 +133,7 @@ class TranscriptionMetadata(BaseModel):
     language: str
     processing_time: float
     diarization_enabled: bool
+    polished: bool
 
 class TranscriptionResponse(BaseModel):
     success: bool
@@ -201,15 +203,82 @@ def cleanup_old_jobs():
         if expired_jobs:
             print(f"Cleaned up {len(expired_jobs)} expired jobs")
 
-def summarize_text_with_gemini(text: str) -> dict:
+def polish_segments_batch(segments_text: list, language: str = "id") -> list:
+    """Polish multiple segments in a single Gemini API call for efficiency"""
+    if not gemini_client:
+        return segments_text  # Return original if Gemini not available
+    
+    if not segments_text:
+        return []
+    
+    # Language-specific instructions
+    language_instruction = ""
+    if language == "id":
+        language_instruction = "\n\nIMPORTANT: Output MUST be in Indonesian (Bahasa Indonesia)."
+    elif language == "en":
+        language_instruction = "\n\nIMPORTANT: Output MUST be in English."
+    else:
+        language_instruction = f"\n\nIMPORTANT: Output MUST be in {language}."
+    
+    # Create numbered list for batch processing
+    numbered_segments = "\n".join([f"{i+1}. {text}" for i, text in enumerate(segments_text)])
+    
+    prompt = f"""Polish these call transcript segments. For each segment:
+- Fix grammar, punctuation, capitalization
+- Remove filler words (um, uh, hmm, you know, like, gitu, etc.)
+- Correct misheard words
+- Keep the meaning exact{language_instruction}
+
+Return ONLY the polished segments in the same numbered format, one per line. Do not add explanations.
+
+Segments:
+{numbered_segments}"""
+    
+    try:
+        response = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt
+        )
+        result_text = response.text.strip()
+        
+        # Parse the numbered response
+        polished_segments = []
+        for line in result_text.split('\n'):
+            line = line.strip()
+            if line and (line[0].isdigit() or line.startswith('*')):
+                # Remove number prefix (e.g., "1. " or "* ")
+                text = line.split('.', 1)[-1].strip() if '.' in line else line[1:].strip()
+                polished_segments.append(text)
+        
+        # Ensure we have the same number of segments
+        if len(polished_segments) != len(segments_text):
+            print(f"Warning: Segment count mismatch. Expected {len(segments_text)}, got {len(polished_segments)}")
+            return segments_text  # Return original on mismatch
+        
+        return polished_segments
+    
+    except Exception as e:
+        print(f"Warning: Batch segment polishing failed: {e}")
+        return segments_text  # Return original on error
+
+def summarize_text_with_gemini(text: str, language: str = "id") -> dict:
     """Summarize text using Gemini API and generate next steps suggestion"""
     if not gemini_client:
         raise Exception("Gemini API not configured. Set GEMINI_API_KEY in .env")
     
+    # Language-specific instructions
+    language_instruction = ""
+    if language == "id":
+        language_instruction = "\n\nIMPORTANT: Respond in Indonesian (Bahasa Indonesia) language only. Both summary and next steps must be in Indonesian."
+    elif language == "en":
+        language_instruction = "\n\nIMPORTANT: Respond in English language only. Both summary and next steps must be in English."
+    else:
+        language_instruction = f"\n\nIMPORTANT: Respond in {language} language only. Both summary and next steps must be in {language}."
+    
     prompt = f"""Analyze the following transcript and provide:
 
 1. A clear, concise summary paragraph focusing on main topics and key points
-2. A suggestion paragraph for recommended next steps or actions based on the conversation
+2. A suggestion paragraph for recommended next steps or actions based on the conversation{language_instruction}
 
 Format your response EXACTLY as follows:
 
@@ -338,6 +407,31 @@ def process_transcription_job(job_id: str, **kwargs):
                         })
                         full_text += segment.text + " "
                 
+                # Polish segments only (full transcript will be built from polished segments)
+                if gemini_client:
+                    with jobs_lock:
+                        jobs[job_id]["progress"] = "polishing"
+                    
+                    try:
+                        # Use detected language from Whisper or provided language
+                        detected_language = info.language if hasattr(info, 'language') else (language or "id")
+                        
+                        # Polish individual segments
+                        segment_texts = [seg["text"] for seg in segment_list]
+                        polished_segment_texts = polish_segments_batch(segment_texts, detected_language)
+                        
+                        # Update segments with polished text
+                        for i, polished_text in enumerate(polished_segment_texts):
+                            if i < len(segment_list):
+                                segment_list[i]["text"] = polished_text
+                        
+                    except Exception as e:
+                        print(f"Warning: Segment polishing failed: {e}")
+                        # Continue with unpolished segments if polishing fails
+                
+                # Build full transcript from polished segments
+                polished_transcript = " ".join([seg["text"] for seg in segment_list])
+                
                 processing_time = time.time() - start_time
                 
                 # Build result
@@ -347,9 +441,10 @@ def process_transcription_job(job_id: str, **kwargs):
                         "audio_length": round(info.duration, 2),
                         "language": info.language,
                         "processing_time": round(processing_time, 2),
-                        "diarization_enabled": enable_diarization and diarization is not None
+                        "diarization_enabled": enable_diarization and diarization is not None,
+                        "polished": gemini_client is not None
                     },
-                    "full_transcript": full_text.strip(),
+                    "full_transcript": polished_transcript,
                     "segments": segment_list
                 }
                 
@@ -434,12 +529,19 @@ def process_summarization_job(job_id: str, input_type: str, **kwargs):
             else:  # text input
                 full_text = kwargs.get("text")
                 transcript_data = None
-            
+                language = kwargs.get("language", "id")  # Get language from kwargs, default to 'id'
+
             # Step 2: Summarize with Gemini
             with jobs_lock:
                 jobs[job_id]["progress"] = "summarizing"
             
-            gemini_result = summarize_text_with_gemini(full_text)
+            # Use detected language for audio or provided language for text
+            if input_type == "audio":
+                detected_language = info.language if hasattr(info, 'language') else (language or "id")
+            else:
+                detected_language = language
+            
+            gemini_result = summarize_text_with_gemini(full_text, detected_language)
             
             # Build result
             result = {
@@ -488,11 +590,11 @@ async def health_check(request: Request):
         status="healthy",
         model=MODEL_SIZE,
         diarization_enabled=ENABLE_DIARIZATION,
+        polishing_enabled=gemini_client is not None,
         max_concurrent_requests=MAX_CONCURRENT_REQUESTS,
         rate_limit=RATE_LIMIT,
         global_rate_limit=GLOBAL_RATE_LIMIT,
-        max_file_size_mb=MAX_FILE_SIZE // (1024 * 1024),
-        ai_model=GEMINI_MODEL,
+        max_file_size_mb=MAX_FILE_SIZE // (1024 * 1024)
     )
 
 @app.post("/transcribe", response_model=JobResponse)
@@ -508,13 +610,19 @@ async def transcribe(
     _: bool = Depends(verify_api_key)
 ):
     """
-    Transcribe audio file with optional speaker diarization (async)
+    Transcribe audio file with optional speaker diarization and automatic polishing (async)
     
     - **audio**: Audio file (WAV, MP3, etc.)
     - **language**: Optional language code ('en', 'id', etc.)
     - **enable_diarization**: Enable speaker identification
     - **num_speakers**: Expected number of speakers (if diarization enabled)
     - **clean_audio_flag**: Normalize and clean audio before processing
+    
+    The transcript will be automatically polished with Gemini AI (if configured) to:
+    - Fix grammar, punctuation, and capitalization
+    - Remove filler words (um, uh, etc.)
+    - Correct misheard words based on context
+    - Optimize for CRM/telemarketing call quality
     
     Returns job_id immediately. Poll GET /jobs/{job_id} for result.
     
@@ -585,8 +693,12 @@ async def summarize(
     Summarize audio or text (async processing)
     
     Send either:
-    - **audio**: Audio file → Returns transcript + summary
-    - **text**: Text string → Returns summary only
+    - **audio**: Audio file → Returns transcript + summary (language auto-detected)
+    - **text**: Text string → Returns summary only (specify language parameter)
+    
+    - **language**: Language code for output ('en', 'id', etc.). For audio, auto-detected. For text, defaults to 'en'.
+    
+    The summary and next steps will be generated in the same language as the input/detected language.
     
     Returns job_id immediately. Poll GET /jobs/{job_id} for result.
     
@@ -666,7 +778,7 @@ async def summarize(
         thread = threading.Thread(
             target=process_summarization_job,
             args=(job_id, input_type),
-            kwargs={"text": text},
+            kwargs={"text": text, "language": language or "id"},
             daemon=True
         )
         thread.start()
@@ -722,6 +834,7 @@ if __name__ == '__main__':
     print(f"Model: {MODEL_SIZE}")
     print(f"CPU Threads: {CPU_THREADS}")
     print(f"Diarization: {'Enabled' if ENABLE_DIARIZATION else 'Disabled'}")
+    print(f"Transcript Polishing: {'Enabled' if gemini_client else 'Disabled (set GEMINI_API_KEY to enable)'}")
     print(f"Summarization: {'Enabled' if gemini_client else 'Disabled (set GEMINI_API_KEY to enable)'}")
     print(f"Authentication: {'Enabled' if API_KEY else 'Disabled (set API_KEY to enable)'}")
     print(f"\n--- Protection Limits ---")
