@@ -258,8 +258,22 @@ Segments:
         return polished_segments
     
     except Exception as e:
-        print(f"Warning: Batch segment polishing failed: {e}")
-        return segments_text  # Return original on error
+        error_msg = str(e).lower()
+        
+        # Check for rate limit / quota errors
+        if "quota" in error_msg or "rate limit" in error_msg or "429" in error_msg or "resource" in error_msg:
+            print(f"ERROR: Gemini API quota/rate limit exceeded: {e}")
+            raise Exception(f"Gemini API quota exceeded. Please try again later or check your API limits. Error: {e}")
+        
+        # Check for authentication errors
+        elif "api key" in error_msg or "unauthorized" in error_msg or "401" in error_msg or "403" in error_msg:
+            print(f"ERROR: Gemini API authentication failed: {e}")
+            raise Exception(f"Gemini API authentication failed. Please check your API key. Error: {e}")
+        
+        # Other errors - return original
+        else:
+            print(f"Warning: Batch segment polishing failed: {e}")
+            return segments_text  # Return original on error
 
 def summarize_text_with_gemini(text: str, language: str = "id") -> dict:
     """Summarize text using Gemini API and generate next steps suggestion"""
@@ -316,7 +330,19 @@ Transcript:
             "next_steps_suggestion": next_steps_suggestion
         }
     except Exception as e:
-        raise Exception(f"Gemini API error: {str(e)}")
+        error_msg = str(e).lower()
+        
+        # Check for rate limit / quota errors
+        if "quota" in error_msg or "rate limit" in error_msg or "429" in error_msg or "resource" in error_msg:
+            raise Exception(f"Gemini API quota exceeded. Please try again later or check your API limits. Error: {e}")
+        
+        # Check for authentication errors
+        elif "api key" in error_msg or "unauthorized" in error_msg or "401" in error_msg or "403" in error_msg:
+            raise Exception(f"Gemini API authentication failed. Please check your API key. Error: {e}")
+        
+        # Other errors
+        else:
+            raise Exception(f"Gemini API error: {str(e)}")
 
 def process_transcription_job(job_id: str, **kwargs):
     """Background worker to process transcription job"""
@@ -407,8 +433,11 @@ def process_transcription_job(job_id: str, **kwargs):
                         })
                         full_text += segment.text + " "
                 
-                # Polish segments only (full transcript will be built from polished segments)
-                if gemini_client:
+                # Build full transcript from segments
+                polished_transcript = " ".join([seg["text"] for seg in segment_list]).strip()
+                
+                # Only polish if transcript is not empty
+                if polished_transcript and gemini_client:
                     with jobs_lock:
                         jobs[job_id]["progress"] = "polishing"
                     
@@ -425,12 +454,12 @@ def process_transcription_job(job_id: str, **kwargs):
                             if i < len(segment_list):
                                 segment_list[i]["text"] = polished_text
                         
+                        # Rebuild full transcript from polished segments
+                        polished_transcript = " ".join([seg["text"] for seg in segment_list]).strip()
+                        
                     except Exception as e:
                         print(f"Warning: Segment polishing failed: {e}")
                         # Continue with unpolished segments if polishing fails
-                
-                # Build full transcript from polished segments
-                polished_transcript = " ".join([seg["text"] for seg in segment_list])
                 
                 processing_time = time.time() - start_time
                 
@@ -530,7 +559,11 @@ def process_summarization_job(job_id: str, input_type: str, **kwargs):
                 full_text = kwargs.get("text")
                 transcript_data = None
                 language = kwargs.get("language", "id")  # Get language from kwargs, default to 'id'
-
+            
+            # Check if transcript is empty
+            if not full_text or not full_text.strip():
+                raise Exception("Transcript is empty. Nothing to summarize.")
+            
             # Step 2: Summarize with Gemini
             with jobs_lock:
                 jobs[job_id]["progress"] = "summarizing"
@@ -541,7 +574,7 @@ def process_summarization_job(job_id: str, input_type: str, **kwargs):
             else:
                 detected_language = language
             
-            gemini_result = summarize_text_with_gemini(full_text, detected_language)
+            gemini_result = summarize_text_with_gemini(full_text.strip(), detected_language)
             
             # Build result
             result = {
