@@ -1,8 +1,6 @@
 import os
 import time
 import tempfile
-import secrets
-import asyncio
 import uuid
 import threading
 from typing import Optional, Dict, Any
@@ -23,6 +21,9 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from google import genai
+import boto3
+import requests
+from urllib.parse import urlparse
 
 # Load environment variables from .env file
 load_dotenv()
@@ -48,6 +49,11 @@ MODEL_SIZE = os.getenv("MODEL_SIZE", "small")
 ENABLE_DIARIZATION = os.getenv("ENABLE_DIARIZATION", "false").lower() == "true"
 CPU_THREADS = int(os.getenv("CPU_THREADS", "4"))
 API_KEY = os.getenv("API_KEY", None)  # If not set, auth is disabled
+
+# AWS S3 configuration
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", None)
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", None)
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 
 # Gemini configuration
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", None)
@@ -87,6 +93,22 @@ if GEMINI_API_KEY:
 else:
     gemini_client = None
     print("Warning: GEMINI_API_KEY not set. Transcript polishing and summarization will be disabled.")
+
+# Initialize AWS S3 client
+s3_client = None
+if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
+    try:
+        s3_client = boto3.client(
+            's3',
+            aws_access_key_id=AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+            region_name=AWS_REGION
+        )
+        print("AWS S3 client initialized successfully")
+    except Exception as e:
+        print(f"Warning: Failed to initialize S3 client: {e}")
+else:
+    print("Warning: AWS credentials not set. S3 URL support will be disabled.")
 
 # Request queue semaphore to limit concurrent processing
 request_semaphore = threading.Semaphore(MAX_CONCURRENT_REQUESTS)
@@ -161,16 +183,100 @@ class JobStatusResponse(BaseModel):
     processing_time: Optional[float] = None
 
 # --- HELPER FUNCTIONS ---
-def clean_audio(input_file: str, output_file: str) -> str:
-    """Clean and normalize audio file"""
-    audio = AudioSegment.from_file(input_file)
-    audio = audio.set_channels(1)
-    audio = audio.set_frame_rate(16000)
-    normalized_audio = normalize(audio)
-    normalized_audio.export(output_file, format="wav")
-    return output_file
+def download_file_from_url(url: str, timeout: int = 300) -> tuple[bytes, str]:
+    """
+    Download file from URL (S3 or HTTP/HTTPS)
+    
+    For S3 URLs:
+    - If AWS credentials configured: Uses boto3 SDK (for private buckets)
+    - If no credentials: Falls back to HTTPS download (for public URLs)
+    
+    Returns: (file_content, filename)
+    """
+    parsed_url = urlparse(url)
+    
+    # Check if it's an S3 URL AND we have credentials configured
+    if parsed_url.hostname and 's3' in parsed_url.hostname and s3_client:
+        # Try using S3 SDK first (for private buckets with credentials)
+        try:
+            # Parse S3 bucket and key from URL
+            path_parts = parsed_url.path.lstrip('/').split('/', 1)
+            
+            if 's3.amazonaws.com' in parsed_url.hostname:
+                # Format: https://bucket.s3.amazonaws.com/key/to/file.mp3
+                # or: https://bucket.s3.region.amazonaws.com/key/to/file.mp3
+                bucket = parsed_url.hostname.split('.')[0]
+                key = parsed_url.path.lstrip('/')
+            elif parsed_url.hostname.startswith('s3'):
+                # Format: https://s3.region.amazonaws.com/bucket/key/to/file.mp3
+                bucket = path_parts[0]
+                key = path_parts[1] if len(path_parts) > 1 else ''
+            else:
+                # Custom domain or other S3 format
+                bucket = parsed_url.hostname.split('.')[0]
+                key = parsed_url.path.lstrip('/')
+            
+            if not key:
+                raise HTTPException(status_code=400, detail="Invalid S3 URL: missing object key")
+            
+            # Download from S3 using SDK
+            response = s3_client.get_object(Bucket=bucket, Key=key)
+            content = response['Body'].read()
+            
+            # Extract filename from key
+            filename = os.path.basename(key)
+            
+            return content, filename
+        
+        except s3_client.exceptions.NoSuchKey:
+            raise HTTPException(status_code=404, detail="S3 object not found")
+        except s3_client.exceptions.NoSuchBucket:
+            raise HTTPException(status_code=404, detail="S3 bucket not found")
+        except Exception as e:
+            # If S3 SDK fails, fall back to HTTPS download (might be a public URL)
+            print(f"S3 SDK download failed, falling back to HTTPS: {e}")
+            pass
+    
+    # Regular HTTP/HTTPS download (works for public S3 URLs too!)
+    try:
+        response = requests.get(url, timeout=timeout, stream=True)
+        response.raise_for_status()
+        
+        # Check content length if available
+        content_length = response.headers.get('content-length')
+        if content_length and int(content_length) > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large. Maximum size: {MAX_FILE_SIZE // (1024 * 1024)} MB"
+            )
+        
+        # Download content
+        content = b''
+        for chunk in response.iter_content(chunk_size=8192):
+            content += chunk
+            if len(content) > MAX_FILE_SIZE:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File too large. Maximum size: {MAX_FILE_SIZE // (1024 * 1024)} MB"
+                )
+        
+        # Extract filename from URL or Content-Disposition header
+        filename = None
+        if 'content-disposition' in response.headers:
+            content_disp = response.headers['content-disposition']
+            if 'filename=' in content_disp:
+                filename = content_disp.split('filename=')[1].strip('"\'')
+        
+        if not filename:
+            filename = os.path.basename(parsed_url.path) or 'audio.wav'
+        
+        return content, filename
+    
+    except requests.exceptions.Timeout:
+        raise HTTPException(status_code=504, detail="URL download timeout")
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=400, detail=f"Failed to download from URL: {str(e)}")
 
-# --- HELPER FUNCTIONS ---
 def clean_audio(input_file: str, output_file: str) -> str:
     """Clean and normalize audio file"""
     audio = AudioSegment.from_file(input_file)
@@ -189,7 +295,7 @@ def get_tracks(obj):
         if hasattr(val, 'itertracks'):
             return val
     return None
-
+    
 def cleanup_old_jobs():
     """Remove expired jobs from storage"""
     with jobs_lock:
@@ -604,16 +710,6 @@ def process_summarization_job(job_id: str, input_type: str, **kwargs):
                     "failed_at": datetime.utcnow().isoformat() + "Z"
                 })
 
-def get_tracks(obj):
-    """Extract speaker tracks from diarization object"""
-    if hasattr(obj, 'itertracks'):
-        return obj
-    for attr in dir(obj):
-        val = getattr(obj, attr, None)
-        if hasattr(val, 'itertracks'):
-            return val
-    return None
-
 # --- API ENDPOINTS ---
 @app.get("/health", response_model=HealthResponse)
 @limiter.limit("60/minute")
@@ -635,7 +731,8 @@ async def health_check(request: Request):
 @limiter.limit(GLOBAL_RATE_LIMIT, key_func=lambda: "global")  # Global rate limit
 async def transcribe(
     request: Request,
-    audio: UploadFile = File(..., description="Audio file to transcribe"),
+    audio: Optional[UploadFile] = File(None, description="Audio file to transcribe"),
+    audio_url: Optional[str] = Form(None, description="URL to audio file (S3 or HTTP/HTTPS)"),
     language: Optional[str] = Form(None, description="Language code (e.g., 'en', 'id'). Auto-detect if not specified"),
     enable_diarization: bool = Form(False, description="Enable speaker diarization"),
     num_speakers: int = Form(2, description="Number of speakers for diarization"),
@@ -645,7 +742,10 @@ async def transcribe(
     """
     Transcribe audio file with optional speaker diarization and automatic polishing (async)
     
-    - **audio**: Audio file (WAV, MP3, etc.)
+    Provide either:
+    - **audio**: Audio file upload (WAV, MP3, etc.)
+    - **audio_url**: URL to audio file (S3 or HTTP/HTTPS)
+    
     - **language**: Optional language code ('en', 'id', etc.)
     - **enable_diarization**: Enable speaker identification
     - **num_speakers**: Expected number of speakers (if diarization enabled)
@@ -665,13 +765,25 @@ async def transcribe(
     Processing time: 10s-5min depending on audio length
     """
     
-    # Read file content
-    content = await audio.read()
-    if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File too large. Maximum size: {MAX_FILE_SIZE // (1024 * 1024)} MB"
-        )
+    # Validation: must provide audio OR audio_url, not both or neither
+    if audio and audio_url:
+        raise HTTPException(status_code=400, detail="Provide either 'audio' file or 'audio_url', not both")
+    if not audio and not audio_url:
+        raise HTTPException(status_code=400, detail="Must provide either 'audio' file or 'audio_url' parameter")
+    
+    # Get audio content and filename
+    if audio:
+        # Read file content from upload
+        content = await audio.read()
+        if len(content) > MAX_FILE_SIZE:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large. Maximum size: {MAX_FILE_SIZE // (1024 * 1024)} MB"
+            )
+        filename = audio.filename
+    else:
+        # Download from URL
+        content, filename = download_file_from_url(audio_url)
     
     # Generate job ID
     job_id = str(uuid.uuid4())
@@ -693,7 +805,7 @@ async def transcribe(
         args=(job_id,),
         kwargs={
             "content": content,
-            "filename": audio.filename,
+            "filename": filename,
             "language": language,
             "enable_diarization": enable_diarization,
             "num_speakers": num_speakers,
@@ -718,6 +830,7 @@ async def transcribe(
 async def summarize(
     request: Request,
     audio: Optional[UploadFile] = File(None, description="Audio file to transcribe and summarize"),
+    audio_url: Optional[str] = Form(None, description="URL to audio file (S3 or HTTP/HTTPS)"),
     text: Optional[str] = Form(None, description="Text transcript to summarize"),
     language: Optional[str] = Form(None, description="Language code for audio (e.g., 'en', 'id')"),
     _: bool = Depends(verify_api_key)
@@ -726,10 +839,11 @@ async def summarize(
     Summarize audio or text (async processing)
     
     Send either:
-    - **audio**: Audio file → Returns transcript + summary (language auto-detected)
+    - **audio**: Audio file upload → Returns transcript + summary (language auto-detected)
+    - **audio_url**: URL to audio file (S3 or HTTP/HTTPS) → Returns transcript + summary (language auto-detected)
     - **text**: Text string → Returns summary only (specify language parameter)
     
-    - **language**: Language code for output ('en', 'id', etc.). For audio, auto-detected. For text, defaults to 'en'.
+    - **language**: Language code for output ('en', 'id', etc.). For audio, auto-detected. For text, defaults to 'id'.
     
     The summary and next steps will be generated in the same language as the input/detected language.
     
@@ -739,11 +853,12 @@ async def summarize(
     Processing time: 30s-10min depending on audio length
     """
     
-    # Validation: must provide audio OR text, not both or neither
-    if audio and text:
-        raise HTTPException(status_code=400, detail="Provide either 'audio' or 'text', not both")
-    if not audio and not text:
-        raise HTTPException(status_code=400, detail="Must provide either 'audio' file or 'text' parameter")
+    # Validation: must provide audio OR audio_url OR text, not multiple
+    provided_inputs = sum([bool(audio), bool(audio_url), bool(text)])
+    if provided_inputs > 1:
+        raise HTTPException(status_code=400, detail="Provide only one of: 'audio' file, 'audio_url', or 'text'")
+    if provided_inputs == 0:
+        raise HTTPException(status_code=400, detail="Must provide either 'audio' file, 'audio_url', or 'text' parameter")
     
     # Check if Gemini is configured
     if not gemini_client:
@@ -757,16 +872,22 @@ async def summarize(
     created_at = datetime.utcnow().isoformat() + "Z"
     
     # Determine input type and prepare job data
-    if audio:
+    if audio or audio_url:
         input_type = "audio"
         
-        # Read file content
-        content = await audio.read()
-        if len(content) > MAX_FILE_SIZE:
-            raise HTTPException(
-                status_code=413,
-                detail=f"File too large. Maximum size: {MAX_FILE_SIZE // (1024 * 1024)} MB"
-            )
+        # Get audio content and filename
+        if audio:
+            # Read file content from upload
+            content = await audio.read()
+            if len(content) > MAX_FILE_SIZE:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File too large. Maximum size: {MAX_FILE_SIZE // (1024 * 1024)} MB"
+                )
+            filename = audio.filename
+        else:
+            # Download from URL
+            content, filename = download_file_from_url(audio_url)
         
         # Create job
         with jobs_lock:
@@ -784,7 +905,7 @@ async def summarize(
             args=(job_id, input_type),
             kwargs={
                 "content": content,
-                "filename": audio.filename,
+                "filename": filename,
                 "language": language
             },
             daemon=True
