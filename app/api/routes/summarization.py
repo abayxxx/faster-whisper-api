@@ -21,6 +21,8 @@ async def summarize(
     audio_url: Optional[str] = Form(None, description="URL to audio file (S3 or HTTP/HTTPS)"),
     text: Optional[str] = Form(None, description="Text transcript to summarize"),
     language: Optional[str] = Form(None, description="Language code for audio (e.g., 'en', 'id')"),
+    clean_audio_flag: bool = Form(True, description="Clean audio before transcription (for audio input only)"),
+    enable_polishing: bool = Form(True, description="Enable AI polishing before summarizing (uses API tokens)"),
     _: bool = Depends(verify_api_key)
 ):
     """
@@ -32,6 +34,11 @@ async def summarize(
     - **text**: Text string → Returns summary only (specify language parameter)
     
     - **language**: Language code for output ('en', 'id', etc.). For audio, auto-detected. For text, defaults to 'id'.
+    - **clean_audio_flag**: Clean and normalize audio before transcription (default: true, for audio input only)
+    - **enable_polishing**: Polish transcript with Gemini AI before summarizing (default: true, costs API tokens)
+    
+    If enable_polishing=true, the transcript will be polished before summarization for better quality.
+    You can disable it to save Gemini API costs.
     
     The summary and next steps will be generated in the same language as the input/detected language.
     
@@ -80,7 +87,9 @@ async def summarize(
             kwargs={
                 "content": content,
                 "filename": filename,
-                "language": language
+                "language": language,
+                "clean_audio_flag": clean_audio_flag,
+                "enable_polishing": enable_polishing
             },
             daemon=True
         )

@@ -24,6 +24,8 @@ def process_summarization_job(job_id: str, input_type: str, **kwargs):
                 content = kwargs.get("content")
                 filename = kwargs.get("filename")
                 language = kwargs.get("language")
+                clean_audio_flag = kwargs.get("clean_audio_flag", True)
+                enable_polishing = kwargs.get("enable_polishing", True)
                 
                 suffix = os.path.splitext(filename)[1] if filename else '.wav'
                 with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_input:
@@ -31,7 +33,18 @@ def process_summarization_job(job_id: str, input_type: str, **kwargs):
                     temp_input_path = temp_input.name
                 
                 try:
-                    segments, info = whisper_service.transcribe(temp_input_path, language)
+                    # Clean audio if requested
+                    if clean_audio_flag:
+                        from app.services import clean_audio
+                        with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_cleaned:
+                            temp_cleaned_path = temp_cleaned.name
+                        clean_audio(temp_input_path, temp_cleaned_path)
+                        audio_path = temp_cleaned_path
+                    else:
+                        audio_path = temp_input_path
+                        temp_cleaned_path = None
+                    
+                    segments, info = whisper_service.transcribe(audio_path, language)
                     
                     full_text = ""
                     segment_list = []
@@ -43,6 +56,25 @@ def process_summarization_job(job_id: str, input_type: str, **kwargs):
                             "text": segment.text.strip()
                         })
                     
+                    # Polish transcript if enabled
+                    if enable_polishing and full_text.strip() and gemini_service.is_available():
+                        update_job(job_id, {"progress": "polishing"})
+                        
+                        try:
+                            detected_language = info.language if hasattr(info, 'language') else (language or "id")
+                            segment_texts = [seg["text"] for seg in segment_list]
+                            polished_texts = gemini_service.polish_segments_batch(segment_texts, detected_language)
+                            
+                            # Update segments with polished text
+                            for i, polished_text in enumerate(polished_texts):
+                                if i < len(segment_list):
+                                    segment_list[i]["text"] = polished_text
+                            
+                            # Rebuild full text from polished segments
+                            full_text = " ".join([seg["text"] for seg in segment_list])
+                        except Exception as e:
+                            print(f"Warning: Polishing failed, continuing with unpolished transcript: {e}")
+                    
                     transcript_data = {
                         "full_text": full_text.strip(),
                         "segments": segment_list,
@@ -51,6 +83,11 @@ def process_summarization_job(job_id: str, input_type: str, **kwargs):
                     }
                 finally:
                     os.unlink(temp_input_path)
+                    if clean_audio_flag and temp_cleaned_path:
+                        try:
+                            os.unlink(temp_cleaned_path)
+                        except:
+                            pass
             
             else:  # text input
                 full_text = kwargs.get("text")
