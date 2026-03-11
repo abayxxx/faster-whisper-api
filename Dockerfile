@@ -16,6 +16,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code and .env file
 COPY whisper_api.py .
+COPY app/ ./app/
 COPY .env .
 
 # Expose port (default 8000, but will use value from .env)

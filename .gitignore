@@ -15,5 +15,3 @@ build
 *.txt
 !requirements.txt
 .git
-example_go_client.go
-README_API.md
