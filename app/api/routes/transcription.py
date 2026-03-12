@@ -43,7 +43,6 @@ async def transcribe(
     - Fix grammar, punctuation, and capitalization
     - Remove filler words (um, uh, etc.)
     - Correct misheard words based on context
-    - Optimize for CRM/telemarketing call quality
     
     Returns job_id immediately. Poll GET /jobs/{job_id} for result.
     """
